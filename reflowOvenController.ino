@@ -94,17 +94,16 @@
 // Comment either one the following #define to select your board revision
 // Newer board version starts from v1.60 using MAX31855KASA+ chip 
 #define  USE_MAX31855
-// Older board version below version v1.60 using MAX6675ISA+ chip
-//#define USE_MAX6675
 
 // ***** INCLUDES *****
-#include <LiquidCrystal.h>
-#ifdef	USE_MAX31855
-	#include <MAX31855.h>
-#else
-	#include <max6675.h>
-#endif
+// LCD Shield
+#include <Wire.h>
+#include <Adafruit_MCP23017.h>
+#include <Adafruit_RGBLCDShield.h>
+// Thermocoupler
 #include <PID_v1.h>
+#include <SPI.h>
+#include "Adafruit_MAX31855.h"
 
 // ***** TYPE DEFINITIONS *****
 typedef enum REFLOW_STATE
@@ -173,7 +172,7 @@ const char* lcdMessagesReflowStatus[] = {
   "Reflow",
   "Cool",
   "Complete",
-	"Wait,hot",
+  "Wait,hot",
   "Error"
 };
 
@@ -182,37 +181,20 @@ unsigned char degree[8]  = {
   140,146,146,140,128,128,128,128};
 
 // ***** PIN ASSIGNMENT *****
-#ifdef	USE_MAX31855
-	int ssrPin = 5;
-	int thermocoupleSOPin = A3;
-	int thermocoupleCSPin = A2;
-	int thermocoupleCLKPin = A1;
-	int lcdRsPin = 7;
-	int lcdEPin = 8;
-	int lcdD4Pin = 9;
-	int lcdD5Pin = 10;
-	int lcdD6Pin = 11;
-	int lcdD7Pin = 12;
-	int ledRedPin = 4;
-	int buzzerPin = 6;
-	int switchPin = A0;
-#else
-	int ssrPin = 5;
-	int thermocoupleSOPin = A5;
-	int thermocoupleCSPin = A4;
-	int thermocoupleCLKPin = A3;
-	int lcdRsPin = 7;
-	int lcdEPin = 8;
-	int lcdD4Pin = 9;
-	int lcdD5Pin = 10;
-	int lcdD6Pin = 11;
-	int lcdD7Pin = 12;
-	int ledRedPin = A1;
-	int ledGreenPin = A0;
-	int buzzerPin = 6;
-	int switch1Pin = 2;
-	int switch2Pin = 3;
-#endif
+int ssrPin = 7;
+int thermoCLK = 2;
+int thermoCS = 3;
+int thermoDO = 4;
+int lcdRsPin = 7;
+int lcdEPin = 8;
+int lcdD4Pin = 9;
+int lcdD5Pin = 10;
+int lcdD6Pin = 11;
+int lcdD7Pin = 12;
+//int ledRedPin = 4;
+//int buzzerPin = 6;
+int switchPin = A0;
+
 
 // ***** PID CONTROL VARIABLES *****
 double setpoint;
@@ -242,59 +224,49 @@ int timerSeconds;
 
 // Specify PID control interface
 PID reflowOvenPID(&input, &output, &setpoint, kp, ki, kd, DIRECT);
-// Specify LCD interface
-LiquidCrystal lcd(lcdRsPin, lcdEPin, lcdD4Pin, lcdD5Pin, lcdD6Pin, lcdD7Pin);
-// Specify MAX6675 thermocouple interface
-#ifdef	USE_MAX31855
-	MAX31855 thermocouple(thermocoupleSOPin, thermocoupleCSPin, 
-												thermocoupleCLKPin);
-#else
-	MAX6675 thermocouple(thermocoupleCLKPin, thermocoupleCSPin, 
-											 thermocoupleSOPin);
-#endif
+
+// ************************************************
+// Display Variables and constants
+// ************************************************
+
+Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
+// These #defines make it easy to set the backlight color
+#define RED 0x1
+#define YELLOW 0x3
+#define GREEN 0x2
+#define TEAL 0x6
+#define BLUE 0x4
+#define VIOLET 0x5
+#define WHITE 0x7
+
+#define BUTTON_SHIFT BUTTON_SELECT
+
+unsigned long lastInput = 0; // last button press
+
+// Thermocoupler setup
+Adafruit_MAX31855 thermocouple(thermoCLK, thermoCS, thermoDO);
+
 
 void setup()
 {
   // SSR pin initialization to ensure reflow oven is off
   digitalWrite(ssrPin, LOW);
   pinMode(ssrPin, OUTPUT);
-
-  // Buzzer pin initialization to ensure annoying buzzer is off
-  digitalWrite(buzzerPin, LOW);
-  pinMode(buzzerPin, OUTPUT);
-
-  // LED pins initialization and turn on upon start-up (active low)
-  digitalWrite(ledRedPin, LOW);
-  pinMode(ledRedPin, OUTPUT);
-	#ifdef USE_MAX6675
-    // LED pins initialization and turn on upon start-up (active low)
-    digitalWrite(ledGreenPin, LOW);	
-		pinMode(ledGreenPin, OUTPUT);
-		// Switch pins initialization
-		pinMode(switch1Pin, INPUT);
-		pinMode(switch2Pin, INPUT);
-	#endif	
+	
 
   // Start-up splash
-  digitalWrite(buzzerPin, HIGH);
   lcd.begin(8, 2);
   lcd.createChar(0, degree);
   lcd.clear();
   lcd.print("Reflow");
   lcd.setCursor(0, 1);
   lcd.print("Oven 1.2");
-  digitalWrite(buzzerPin, LOW);
   delay(2500);
   lcd.clear();
 
   // Serial communication at 57600 bps
   Serial.begin(57600);
 
-  // Turn off LED (active low)
-  digitalWrite(ledRedPin, HIGH);
-	#ifdef  USE_MAX6675
-		digitalWrite(ledGreenPin, HIGH);
-	#endif
   // Set window size
   windowSize = 2000;
   // Initialize time keeping variable
@@ -314,19 +286,14 @@ void loop()
     // Read thermocouple next sampling period
     nextRead += SENSOR_SAMPLING_TIME;
     // Read current temperature
-		#ifdef	USE_MAX31855
-			input = thermocouple.readThermocouple(CELSIUS);
-		#else
+
 			input = thermocouple.readCelsius();
-		#endif
+
 		
     // If thermocouple problem detected
-		#ifdef	USE_MAX6675
+
 			if (isnan(input))
-		#else
-			if((input == FAULT_OPEN) || (input == FAULT_SHORT_GND) || 
-				 (input == FAULT_SHORT_VCC))
-    #endif
+
 		{
       // Illegal operation
       reflowState = REFLOW_STATE_ERROR;
@@ -341,8 +308,8 @@ void loop()
     // If reflow process is on going
     if (reflowStatus == REFLOW_STATUS_ON)
     {
-      // Toggle red LED as system heart beat
-      digitalWrite(ledRedPin, !(digitalRead(ledRedPin)));
+
+
       // Increase seconds timer for reflow curve analysis
       timerSeconds++;
       // Send temperature and time stamp to serial 
@@ -356,8 +323,7 @@ void loop()
     }
     else
     {
-      // Turn off red LED
-      digitalWrite(ledRedPin, HIGH);
+      
     }
 
     // Clear LCD
@@ -477,11 +443,7 @@ void loop()
     {
       // Retrieve current time for buzzer usage
       buzzerPeriod = millis() + 1000;
-      // Turn on buzzer and green LED to indicate completion
-			#ifdef	USE_MAX6675
-				digitalWrite(ledGreenPin, LOW);
-      #endif
-			digitalWrite(buzzerPin, HIGH);
+
       // Turn off reflow process
       reflowStatus = REFLOW_STATUS_OFF;                
       // Proceed to reflow Completion state
@@ -492,11 +454,7 @@ void loop()
   case REFLOW_STATE_COMPLETE:
     if (millis() > buzzerPeriod)
     {
-      // Turn off buzzer and green LED
-      digitalWrite(buzzerPin, LOW);
-			#ifdef	USE_MAX6675
-				digitalWrite(ledGreenPin, HIGH);
-			#endif
+
 			// Reflow process ended
       reflowState = REFLOW_STATE_IDLE; 
     }
@@ -513,12 +471,10 @@ void loop()
 		
   case REFLOW_STATE_ERROR:
     // If thermocouple problem is still present
-		#ifdef	USE_MAX6675
+
 			if (isnan(input))
-		#else
-			if((input == FAULT_OPEN) || (input == FAULT_SHORT_GND) || 
-				 (input == FAULT_SHORT_VCC))
-    #endif
+
+
     {
       // Wait until thermocouple wire is connected
       reflowState = REFLOW_STATE_ERROR; 
